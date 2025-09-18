@@ -1,0 +1,1329 @@
+# -*- coding: utf-8 -*-
+from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from jinja2 import Template
+from google import genai
+from typing import Optional
+import os, re, uuid, json
+from datetime import datetime
+from base64 import b64decode
+
+# ====== FastAPI & Gemini ======
+app = FastAPI()
+client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+# Static media for images
+MEDIA_ROOT = "media"
+os.makedirs(MEDIA_ROOT, exist_ok=True)
+app.mount("/media", StaticFiles(directory=MEDIA_ROOT), name="media")
+
+# ====== Database ======
+DB_FILE = "db.sqlite"
+engine = create_engine(f"sqlite:///{DB_FILE}", echo=False)
+
+class Project(SQLModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+    name: str
+    kind: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class History(SQLModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+    question: str
+    answer: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class GeneralNotes(SQLModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+    text: str = ""
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Rule(SQLModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+    project_id: int | None = Field(default=None, foreign_key="project.id")  # None => כלל-גג
+    text: str
+    mode: str = Field(default="enforce")  # enforce | warn | off
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Illustration(SQLModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+    file_path: str
+    prompt: str
+    style: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+# ביקורות: kind = 'general' | 'proofread'; source = 'pasted' | 'notes'
+class Review(SQLModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+    kind: str
+    source: str
+    title: str
+    input_size: int = 0
+    result: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+SQLModel.metadata.create_all(engine)
+
+# ====== HTML ======
+HOME_HTML = """
+<html dir="rtl">
+<head><meta charset="utf-8"><title>סתם סופר</title>
+<style>
+  body{font-family:Arial, sans-serif; max-width:980px; margin:24px auto;}
+  h1{margin-bottom:4px}
+  ul{line-height:1.9}
+  .linklike{background:#f6f6f6; border:1px solid #ddd; border-radius:6px; padding:4px 8px; font-size:13px;}
+</style>
+</head>
+<body>
+<h1>✍ סתם סופר</h1>
+<h2>בחר או צור פרויקט</h2>
+<form action="/new_project" method="post">
+  שם פרויקט: <input type="text" name="name" required>
+  סוג: <select name="kind"><option>פרוזה</option><option>קומיקס</option></select>
+  <button type="submit">צור</button>
+</form>
+<hr>
+<ul>
+{% for p in projects %}
+<li><a class="linklike" href="/project/{{p.id}}">{{p.name}} ({{p.kind}})</a></li>
+{% endfor %}
+</ul>
+</body>
+</html>
+"""
+
+PROJECT_HTML = """
+<html dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <title>{{project.name}} - סתם סופר</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 980px; margin: 24px auto; }
+    h1 { margin-bottom: 4px; }
+    h2 { margin: 0 0 10px 0; color: #444; display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+    textarea { width: 100%; font-size: 16px; }
+    button { padding: 6px 14px; margin-top: 6px; cursor:pointer; }
+    .row{display:flex; gap:10px; align-items:flex-start; flex-wrap:wrap}
+    .btnrow{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+    #status { color: #666; font-size: 13px; margin-top: 4px; }
+    #result { margin-top: 16px; padding: 12px; border: 1px solid #ddd; border-radius: 10px; min-height: 160px; max-height: 55vh; overflow:auto; background:#fff; }
+    .turn { margin: 10px 0; }
+    .meta{color:#888; font-size:12px; margin-bottom:4px}
+    .bubble{border:1px solid #e6e6e6; border-radius:12px; padding:10px; white-space:pre-wrap}
+    .q .bubble{background:#f9fbff}
+    .a .bubble{background:#fafafa}
+    .linklike { background:#f6f6f6; border:1px solid #ddd; border-radius:6px; padding:4px 8px; font-size:13px; }
+    .muted { color:#777; }
+    .hint { color:#777; font-size:12px; text-align:right }
+    .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.3); display:none; }
+    .modal { position:fixed; top:8%; left:50%; transform:translateX(-50%); width:min(1000px, 96vw); background:#fff; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.25); display:none; }
+    .modal header { padding:10px 12px; border-bottom:1px solid #eee; display:flex; justify-content:space-between; align-items:center;}
+    .modal .content { max-height:65vh; overflow:auto; padding:10px 12px; }
+    .modal footer { padding:10px 12px; border-top:1px solid #eee; display:flex; gap:8px; justify-content:flex-end;}
+    #notesArea{width:100%; height:52vh; font-size:15px}
+    .pill{font-size:12px; padding:2px 6px; border:1px solid #ddd; border-radius:999px}
+    .field{margin:6px 0}
+    .field input, .field textarea, .field select{width:100%}
+    .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px}
+    .card{border:1px solid #eee; border-radius:8px; padding:6px}
+    .card img{width:100%; height:180px; object-fit:cover; border-radius:6px; display:block}
+    .small{font-size:12px; color:#666}
+    .list{border:1px solid #eee; border-radius:8px; padding:8px; max-height:40vh; overflow:auto}
+    .li{border-bottom:1px solid #f3f3f3; padding:6px 4px}
+    .li:last-child{border-bottom:none}
+    .li h4{margin:0 0 4px 0; font-size:14px}
+    .rowflex{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+    .two-col{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+    .box{border:1px solid #eee; border-radius:8px; padding:8px}
+    .tabs{display:flex; gap:8px; margin-top:6px}
+    .tabs .tabbtn{padding:6px 10px; border:1px solid #ddd; border-radius:999px; font-size:13px; cursor:pointer; background:#f6f6f6}
+    .tabs .tabbtn.active{background:#e8f0ff; border-color:#c7dbff}
+  </style>
+</head>
+<body data-project-id="{{project.id}}">
+  <h1>✍ סתם סופר</h1>
+  <h2>
+    📘 פרויקט: {{project.name}} ({{project.kind}})
+    <button id="rulesBtn" class="linklike" type="button">כללים</button>
+    <button id="notesBtn" class="linklike" type="button">קובץ כללי</button>
+    <button id="exportBtn" class="linklike" type="button">ייצוא צ'אט</button>
+    <button id="clearChatBtn" class="linklike" type="button">נקה שיחה</button>
+  </h2>
+
+  <!-- מצב עבודה -->
+  <div class="row" style="margin-bottom:6px">
+    <label class="linklike"><input type="radio" name="mode" value="brainstorm" checked> סיעור מוחות</label>
+    <label class="linklike"><input type="radio" name="mode" value="write"> כתיבה</label>
+    <label class="linklike"><input type="radio" name="mode" value="review"> ביקורת</label>
+    <label class="linklike"><input type="radio" name="mode" value="illustrate"> איור</label>
+    <select id="writeKind" style="display:none">
+      <option value="outline">מתווה פרק</option>
+      <option value="draft">טיוטת פרק</option>
+      <option value="rewrite">שכתוב ושיפור</option>
+    </select>
+  </div>
+
+  <div class="hint">(Ctrl+Enter = שליחה,  Shift+Enter = שורה חדשה)</div>
+
+  <!-- אזור שיחה (סיעור/כתיבה) -->
+  <div id="chatPanel">
+    <div class="btnrow" style="margin-bottom:6px">
+      <button id="historyBtn" class="linklike" type="button" title="שאלות אחרונות">היסטוריה</button>
+    </div>
+    <textarea id="prompt" rows="8" placeholder="כתוב כאן טקסט או שאלה..."></textarea>
+    <div class="btnrow">
+      <button id="sendBtn" type="button">שלח</button>
+      <button id="copyAnsBtn" class="linklike" type="button" title="העתק תשובה אחרונה">העתק תשובה</button>
+      <label style="font-size:13px"><input type="checkbox" id="useNotes" checked> התבסס על 'קובץ כללי'</label>
+      <div id="status"></div>
+    </div>
+    <div id="result"></div>
+  </div>
+
+  <!-- לשונית ביקורת -->
+  <div id="reviewPanel" style="display:none; margin-top:14px">
+    <div class="tabs">
+      <button class="tabbtn active" id="tabGeneral">ביקורת כללית</button>
+      <button class="tabbtn" id="tabProof">הגהה</button>
+    </div>
+
+    <div class="row" style="margin-top:8px">
+      <div style="flex:2; min-width:300px">
+        <div class="field">
+          <label>טקסט לבדיקה (אם ריק — נבדוק את 'קובץ כללי'):</label>
+          <textarea id="reviewInput" rows="10" placeholder="הדבק כאן טקסט מלא לבדיקה, או השאר ריק כדי לבדוק את 'קובץ כללי'..."></textarea>
+        </div>
+        <div class="rowflex">
+          <label style="font-size:13px"><input type="checkbox" id="rvUseNotesWhenEmpty" checked> אם ריק — בדוק את 'קובץ כללי'</label>
+          <label style="font-size:13px"><input type="checkbox" id="rvAllowChunk" checked> חלק אוטומטית אם צריך (כיסוי מלא)</label>
+        </div>
+        <div class="rowflex">
+          <button id="runReviewBtn" class="linklike" type="button">הרץ ביקורת</button>
+          <progress id="rvProg" value="0" max="100" style="width:240px; display:none"></progress>
+          <button id="rvCancelBtn" class="linklike" type="button" style="display:none">בטל</button>
+          <span id="rvStatus" class="muted"></span>
+        </div>
+        <div id="reviewOut" class="box" style="margin-top:8px; white-space:pre-wrap"></div>
+      </div>
+
+      <div style="flex:1; min-width:260px">
+        <h4 style="margin:0 0 8px 0">ביקורות קודמות</h4>
+        <div id="reviewList" class="list"></div>
+        <div class="rowflex" style="margin-top:8px">
+          <button id="compareBtn" class="linklike" type="button">השווה נבחרים (עד 2)</button>
+        </div>
+        <div id="compareOut" class="two-col" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- לשונית איור -->
+  <div id="illustratePanel" style="display:none; margin-top:14px">
+    <div class="row">
+      <div style="flex:1; min-width:300px">
+        <div class="field"><label>תיאור האיור:</label><textarea id="imgDesc" rows="4" placeholder="לדוגמה: שקיעה מעל עיר עתיקה..."></textarea></div>
+        <div class="field"><label>סגנון:</label><input id="imgStyle" placeholder="קומיקס קלאסי / אקוורל / דיו שחור-לבן"></div>
+        <label style="font-size:13px"><input type="checkbox" id="imgUseNotes" checked> עקביות מול 'קובץ כללי'</label>
+        <div class="rowflex" style="margin-top:6px">
+          <button id="genImageBtn" class="linklike" type="button">צור</button>
+          <span id="imgStatus" class="muted"></span>
+        </div>
+      </div>
+      <div style="flex:1; min-width:300px">
+        <div class="field"><label>תכנון איור מתוך טקסט:</label>
+          <textarea id="planText" rows="6" placeholder="הדבק כאן פסקה/קטע; נחלץ תיאור וסגנון מתאימים ונמלא למעלה."></textarea>
+        </div>
+        <div class="rowflex">
+          <button id="planBtn" class="linklike" type="button">תכנן איור מטקסט</button>
+          <span id="planStatus" class="muted"></span>
+        </div>
+      </div>
+    </div>
+    <hr>
+    <div id="gallery" class="grid"></div>
+  </div>
+
+  <p><a href="/">⬅ חזרה לרשימת פרויקטים</a></p>
+
+  <!-- BACKDROP + MODALS -->
+  <div id="backdrop" class="modal-backdrop"></div>
+
+  <div id="notesModal" class="modal" role="dialog" aria-modal="true">
+    <header><strong>קובץ כללי — {{project.name}}</strong><button id="closeNotesBtn" class="linklike" type="button">סגור</button></header>
+    <div class="content"><textarea id="notesArea" placeholder="כאן מחזיקים את הטקסט המאוחד העדכני (א+ב+ג+...)."></textarea>
+    <div class="muted">טיפ: אין צורך להעלות קובץ מחדש — פשוט עדכן כאן ושמור.</div></div>
+    <footer><button id="saveNotesBtn" class="linklike" type="button">שמור</button></footer>
+  </div>
+
+  <div id="histModal" class="modal" role="dialog" aria-modal="true">
+    <header><strong>היסטוריית שאלות (סיעור מוחות)</strong><div><button id="clearHistBtn" class="linklike" type="button">נקה</button><button id="closeHistBtn" class="linklike" type="button">סגור</button></div></header>
+    <div id="histContent" class="content"></div>
+  </div>
+
+  <div id="rulesModal" class="modal" role="dialog" aria-modal="true">
+    <header><strong>כללים</strong><button id="closeRulesBtn" class="linklike" type="button">סגור</button></header>
+    <div class="content" id="rulesContent">
+      <h3>כללי גג <span class="pill">חלים על כל הפרויקטים</span></h3>
+      <div id="rulesGlobal"></div>
+      <div class="rowflex">
+        <textarea id="newGlobalText" placeholder="לדוגמה: אין סמארטפונים לדמויות חיוביות" style="flex:1; height:56px"></textarea>
+        <select id="newGlobalMode"><option value="enforce">אכיפה</option><option value="warn">אזהרה</option><option value="off">כבוי</option></select>
+        <button id="addGlobalBtn" class="linklike" type="button">הוסף</button>
+      </div>
+      <hr>
+      <h3>כללי פרויקט <span class="pill">רק לפרויקט הנוכחי</span></h3>
+      <div id="rulesProject"></div>
+      <div class="rowflex">
+        <textarea id="newProjectText" placeholder="לדוגמה: לשון גבוהה; ללא סלנג" style="flex:1; height:56px"></textarea>
+        <select id="newProjectMode"><option value="enforce">אכיפה</option><option value="warn">אזהרה</option><option value="off">כבוי</option></select>
+        <button id="addProjectBtn" class="linklike" type="button">הוסף</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(async function(){
+  const pid = Number(document.body.getAttribute('data-project-id'));
+
+  // ===== CONSTS =====
+  const MAX_SINGLE = 24000;
+  const CHUNK_SIZE = 12000;
+  const CHUNK_OVERLAP = 800;
+  const CONCURRENCY = 4;
+  const CHUNK_TIMEOUT_MS = 90000;
+  const CHUNK_MAX_RETRIES = 3;
+
+  // ===== Helpers =====
+  function esc(s){return (s||"").replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+  function fmtTime(iso){ const d=new Date(iso); return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+  function chunkText(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP){
+    const out=[]; let i=0;
+    while(i<text.length){
+      const j=Math.min(i+size, text.length);
+      out.push(text.slice(i,j));
+      if(j===text.length) break;
+      i=Math.max(0, j-overlap);
+    }
+    return out;
+  }
+
+  // ===== Modal utils =====
+  const backdrop = document.getElementById('backdrop');
+  function openModal(el){ el.style.display="block"; backdrop.style.display="block"; }
+  function closeAllModals(){ document.querySelectorAll('.modal').forEach(m=>m.style.display="none"); backdrop.style.display="none"; }
+  backdrop.addEventListener("click", closeAllModals);
+
+  // ===== Mode toggle =====
+  const modeRadios = [...document.getElementsByName('mode')];
+  const writeKindEl = document.getElementById('writeKind');
+  const chatPanel = document.getElementById('chatPanel');
+  const reviewPanel = document.getElementById('reviewPanel');
+  const illustratePanel = document.getElementById('illustratePanel');
+  function currentMode(){ return modeRadios.find(r=>r.checked).value; }
+  function currentWriteKind(){ return writeKindEl.value; }
+  function applyModeUI(){
+    const m = currentMode();
+    writeKindEl.style.display = (m==='write') ? 'inline-block' : 'none';
+    chatPanel.style.display   = (m==='review' || m==='illustrate') ? 'none' : 'block';
+    reviewPanel.style.display = (m==='review') ? 'block' : 'none';
+    illustratePanel.style.display = (m==='illustrate') ? 'block' : 'none';
+    document.getElementById('historyBtn').style.display = (m==='brainstorm') ? 'inline-block' : 'none';
+    if (m==='illustrate') loadGallery(); // טען גלריה כשנכנסים לאיור
+  }
+  modeRadios.forEach(r=> r.addEventListener('change', applyModeUI));
+
+  // ===== Main elements =====
+  const btn = document.getElementById('sendBtn');
+  const copyAnsBtn = document.getElementById('copyAnsBtn');
+  const promptEl = document.getElementById('prompt');
+  const resultEl = document.getElementById('result');
+  const statusEl = document.getElementById('status');
+  const exportBtn = document.getElementById('exportBtn');
+  const clearChatBtn = document.getElementById('clearChatBtn');
+  const useNotesEl = document.getElementById('useNotes');
+  const DRAFT_KEY = "draft_"+pid;
+
+  // ===== Notes modal =====
+  const notesBtn = document.getElementById('notesBtn'), notesModal = document.getElementById('notesModal');
+  const closeNotesBtn = document.getElementById('closeNotesBtn'), notesArea = document.getElementById('notesArea');
+  const saveNotesBtn = document.getElementById('saveNotesBtn');
+
+  notesBtn.addEventListener("click", async ()=>{
+    openModal(notesModal);
+    notesArea.value = "טוען...";
+    const res = await fetch("/general/"+pid);
+    const data = await res.json();
+    notesArea.value = data.text || "";
+  });
+  closeNotesBtn.addEventListener("click", closeAllModals);
+  saveNotesBtn.addEventListener("click", async ()=>{
+    const res = await fetch("/general/"+pid, {method:"POST", headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body:new URLSearchParams({ text: notesArea.value })});
+    const data = await res.json();
+    if (data.ok) { alert("נשמר"); closeAllModals(); } else { alert("שגיאה בשמירה"); }
+  });
+
+  // ===== History modal (סיעור בלבד) =====
+  const historyBtn = document.getElementById('historyBtn'), histModal = document.getElementById('histModal');
+  const closeHistBtn = document.getElementById('closeHistBtn'), clearHistBtn = document.getElementById('clearHistBtn');
+  const histContent = document.getElementById('histContent');
+
+  historyBtn.addEventListener("click", async ()=>{
+    openModal(histModal);
+    histContent.innerHTML = "<div class='muted'>טוען...</div>";
+    const res = await fetch("/history/"+pid); const data = await res.json();
+    if (!data.items.length) { histContent.innerHTML = "<div class='muted'>אין עדיין שאלות.</div>"; return; }
+    histContent.innerHTML = data.items.map(q => "<div class='li' title='לחץ כדי להחזיר לתיבה'>"+esc(q)+"</div>").join("");
+    [...histContent.querySelectorAll('.li')].forEach(el=>{
+      el.addEventListener("click", ()=>{ promptEl.value = el.textContent; promptEl.focus(); closeAllModals(); });
+    });
+  });
+  closeHistBtn.addEventListener("click", closeAllModals);
+  clearHistBtn.addEventListener("click", async ()=>{
+    if (!confirm("למחוק את כל ההיסטוריה (שאלות) לפרויקט זה?")) return;
+    await fetch("/history/"+pid+"/clear", {method:"POST"});
+    histContent.innerHTML = "<div class='muted'>נמחק. אין שאלות.</div>";
+  });
+
+  // ===== Rules modal =====
+  const rulesBtn = document.getElementById('rulesBtn'), rulesModal = document.getElementById('rulesModal');
+  const closeRulesBtn = document.getElementById('closeRulesBtn');
+  const rulesGlobal = document.getElementById('rulesGlobal'), rulesProject = document.getElementById('rulesProject');
+  const newGlobalText = document.getElementById('newGlobalText'), newGlobalMode = document.getElementById('newGlobalMode'), addGlobalBtn = document.getElementById('addGlobalBtn');
+  const newProjectText = document.getElementById('newProjectText'), newProjectMode = document.getElementById('newProjectMode'), addProjectBtn = document.getElementById('addProjectBtn');
+
+  function ruleRow(r){return `
+    <div class="rowflex rule" data-id="${r.id}">
+      <textarea style="flex:1; height:56px">${esc(r.text)}</textarea>
+      <select>
+        <option value="enforce" ${r.mode==="enforce"?"selected":""}>אכיפה</option>
+        <option value="warn" ${r.mode==="warn"?"selected":""}>אזהרה</option>
+        <option value="off" ${r.mode==="off"?"selected":""}>כבוי</option>
+      </select>
+      <button class="linklike save" type="button">שמור</button>
+      <button class="linklike del" type="button">מחק</button>
+    </div>`;}
+
+  async function loadRules(){
+    const res = await fetch("/rules/"+pid); const data = await res.json();
+    rulesGlobal.innerHTML = data.global.map(ruleRow).join("") || "<div class='muted'>אין כללי גג עדיין.</div>";
+    rulesProject.innerHTML = data.project.map(ruleRow).join("") || "<div class='muted'>אין כללי פרויקט עדיין.</div>";
+    [...rulesGlobal.querySelectorAll(".rule"), ...rulesProject.querySelectorAll(".rule")].forEach(row=>{
+      const id = row.getAttribute("data-id");
+      row.querySelector(".save").addEventListener("click", async ()=>{
+        const text = row.querySelector("textarea").value, mode = row.querySelector("select").value;
+        await fetch("/rules/"+pid+"/update", {method:"POST", headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body:new URLSearchParams({ id, text, mode })});
+        alert("נשמר");
+      });
+      row.querySelector(".del").addEventListener("click", async ()=>{
+        if (!confirm("למחוק כלל זה?")) return;
+        await fetch("/rules/"+pid+"/delete", {method:"POST", headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body:new URLSearchParams({ id })});
+        await loadRules();
+      });
+    });
+  }
+  rulesBtn.addEventListener("click", async ()=>{ openModal(rulesModal); await loadRules(); });
+  closeRulesBtn.addEventListener("click", closeAllModals);
+  addGlobalBtn.addEventListener("click", async ()=>{
+    const text = (newGlobalText.value||"").trim();
+    const mode = newGlobalMode.value;
+    if(!text){ alert("כתוב כלל להוספה."); return; }
+    await fetch(`/rules/${pid}/add`, {method:"POST", headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body:new URLSearchParams({ scope:"global", text, mode })});
+    newGlobalText.value=""; await loadRules();
+  });
+  addProjectBtn.addEventListener("click", async ()=>{
+    const text = (newProjectText.value||"").trim();
+    const mode = newProjectMode.value;
+    if(!text){ alert("כתוב כלל להוספה."); return; }
+    await fetch(`/rules/${pid}/add`, {method:"POST", headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body:new URLSearchParams({ scope:"project", text, mode })});
+    newProjectText.value=""; await loadRules();
+  });
+
+  // ===== Illustrate panel =====
+  const imgDesc = document.getElementById('imgDesc');
+  const imgStyle = document.getElementById('imgStyle');
+  const imgUseNotes = document.getElementById('imgUseNotes');
+  const genImageBtn = document.getElementById('genImageBtn');
+  const imgStatus = document.getElementById('imgStatus');
+  const gallery = document.getElementById('gallery');
+
+  const planText = document.getElementById('planText');
+  const planBtn = document.getElementById('planBtn');
+  const planStatus = document.getElementById('planStatus');
+
+  async function loadGallery(){
+    gallery.innerHTML = "<div class='muted'>טוען גלריה...</div>";
+    const res = await fetch("/images/"+pid);
+    const data = await res.json();
+    if (!data.items.length){ gallery.innerHTML = "<div class='muted'>אין עדיין איורים.</div>"; return; }
+    gallery.innerHTML = data.items.map(it => `
+      <div class="card">
+        <img src="${it.url}" alt="">
+        <div class="small">${it.style ? ("סגנון: "+esc(it.style)+" • ") : ""}${new Date(it.created_at).toLocaleString()}</div>
+        <div class="small" title="${esc(it.prompt)}">${esc((it.prompt||"").slice(0,80))}${(it.prompt||"").length>80?"…":""}</div>
+        <div class="rowflex">
+          <a class="linklike" href="${it.url}" download>הורד</a>
+          <a class="linklike" href="${it.url}" target="_blank">פתח</a>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  // Ctrl+Enter גם באיור: יצירה
+  imgDesc.addEventListener("keydown", (ev)=>{
+    if (ev.key === "Enter" && ev.ctrlKey){ genImageBtn.click(); ev.preventDefault(); }
+  });
+
+  genImageBtn.addEventListener("click", async ()=>{
+    const desc = imgDesc.value.trim();
+    if (!desc){ alert("כתוב תיאור לאיור"); return; }
+    imgStatus.textContent = "מייצר איור..."; genImageBtn.disabled = true;
+    try{
+      const res = await fetch("/image/"+pid, {
+        method:"POST",
+        headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+        body: new URLSearchParams({ desc, style: imgStyle.value || "", use_notes: imgUseNotes.checked ? "1":"0" })
+      });
+      const data = await res.json();
+      if (!data.ok){ alert("שגיאה ביצירת איור"); }
+      else {
+        await loadGallery();
+        imgStatus.textContent = "נוצר ונשמר לגלריה.";
+        // איפוס אחרי יצירה מוצלחת
+        imgDesc.value = "";
+        // לא מאפסים סגנון כדי להמשיך באותו קו; אם רוצים לאפס: imgStyle.value = "";
+      }
+    } catch(e){
+      alert("שגיאה ברשת");
+    } finally {
+      genImageBtn.disabled = false;
+    }
+  });
+
+  // תכנון איור מטקסט: ממלא את התיאור/סגנון אוטומטית
+  planBtn.addEventListener("click", async ()=>{
+    const text = (planText.value||"").trim();
+    if(!text){ alert("הדבק טקסט לתכנון."); return; }
+    planStatus.textContent = "מנתח טקסט ומתכנן...";
+    try{
+      const res = await fetch(`/image/${pid}/plan`, {
+        method:"POST",
+        headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+        body:new URLSearchParams({ text, use_notes: imgUseNotes.checked ? "1":"0" })
+      });
+      const data = await res.json();
+      if (!data.ok){ alert(data.error || "שגיאה בתכנון"); planStatus.textContent=""; return; }
+      imgDesc.value = data.plan.desc || "";
+      imgStyle.value = data.plan.style || "";
+      planStatus.textContent = "תכנון הוכנס לשדות למעלה.";
+    }catch(e){
+      alert("שגיאה ברשת");
+      planStatus.textContent="";
+    }
+  });
+
+  // ===== Chat transcript =====
+  function renderTurns(items){
+    resultEl.innerHTML = items.map(t => `
+      <div class="turn q">
+        <div class="meta">אתה • ${fmtTime(t.time)}</div>
+        <div class="bubble">${esc(t.q)}</div>
+      </div>
+      <div class="turn a">
+        <div class="meta">סתם סופר • ${fmtTime(t.time)}</div>
+        <div class="bubble">${esc(t.a || "")}</div>
+      </div>
+    `).join("");
+    resultEl.scrollTop = resultEl.scrollHeight;
+  }
+  async function loadChat(){
+    const res = await fetch("/chat/"+pid);
+    const data = await res.json();
+    renderTurns(data.items); return data.items;
+  }
+
+  // העתקת תשובה אחרונה
+  function getLastAnswer(){
+    const bubbles = [...resultEl.querySelectorAll('.turn.a .bubble')];
+    if (!bubbles.length) return "";
+    return bubbles[bubbles.length-1].textContent || "";
+  }
+  document.getElementById('copyAnsBtn').addEventListener("click", async ()=>{
+    const txt = getLastAnswer();
+    if (!txt){ alert("אין תשובה להעתיק."); return; }
+    await navigator.clipboard.writeText(txt);
+    const btn = document.getElementById('copyAnsBtn');
+    btn.textContent = "הועתק ✓";
+    setTimeout(()=> btn.textContent = "העתק תשובה", 1200);
+  });
+
+  // ===== Send (Ctrl+Enter) =====
+  async function sendText(reviewId=null) {
+    const m = currentMode();
+    if (m==='review'){ alert("שליחה לא פעילה בלשונית 'ביקורת'. השתמש ב'הרץ ביקורת'."); return; }
+    if (m==='illustrate'){ alert("שליחה לא פעילה בלשונית 'איור'. השתמש ב'צור' או Ctrl+Enter בתיאור."); return; }
+
+    const text = promptEl.value.trim();
+    if (!text) return;
+    const writeKind = currentWriteKind();
+    const tag = (m==='brainstorm') ? "【סיעור】" : ("【כתיבה: "+(writeKind==='outline'?'מתווה':writeKind==='draft'?'טיוטה':'שכתוב')+"】");
+    const displayQ = tag+" "+text;
+
+    document.getElementById('sendBtn').disabled = true; statusEl.textContent = "שולח...";
+    try {
+      const now = new Date().toISOString();
+      const current = await (await fetch("/chat/"+pid)).json();
+      current.items.push({q: displayQ, a: "", time: now});
+      renderTurns(current.items);
+
+      const body = new URLSearchParams({
+        text, use_notes: document.getElementById('useNotes').checked ? "1" : "0",
+        mode: m, write_kind: writeKind
+      });
+      if (reviewId) body.append("review_id", String(reviewId));
+
+      const res = await fetch("/ask/"+pid, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body });
+      await res.json();
+      await loadChat();
+      // מחיקה אחרי שליחה תקינה
+      promptEl.value = "";
+      localStorage.setItem(DRAFT_KEY, "");
+    } catch(e) {
+      alert("שגיאה בשליחה");
+    } finally {
+      statusEl.textContent = "";
+      document.getElementById('sendBtn').disabled = false;
+      promptEl.focus();
+    }
+  }
+  document.getElementById('sendBtn').addEventListener("click", ()=>sendText());
+  promptEl.addEventListener("keydown", (ev)=>{
+    if (ev.key === "Enter" && ev.shiftKey) return;
+    if (ev.ctrlKey && ev.key === "Enter") { sendText(); ev.preventDefault(); }
+  });
+
+  // ניקוי / ייצוא
+  document.getElementById('clearChatBtn').addEventListener("click", async ()=>{
+    if (!confirm("למחוק את כל השיחה לפרויקט זה?")) return;
+    await fetch("/chat/"+pid+"/clear", {method:"POST"});
+    renderTurns([]);
+  });
+  exportBtn.addEventListener("click", async ()=>{
+    const items = await loadChat();
+    const lines = items.map(t => 
+      "שאלה ("+fmtTime(t.time)+"):\\n"+t.q+"\\n\\nתשובה ("+fmtTime(t.time)+"):\\n"+t.a+"\\n\\n---\\n"
+    ).join("");
+    const blob = new Blob([lines], {type:"text/plain;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = "stam-sofer-chat-"+pid+".txt";
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  // ===== Review logic (נקי, ללא כפילויות) =====
+  const tabGeneral = document.getElementById('tabGeneral');
+  const tabProof   = document.getElementById('tabProof');
+  let currentReviewKind = 'general';
+  function setTab(kind){
+    currentReviewKind = kind;
+    tabGeneral.classList.toggle('active', kind==='general');
+    tabProof.classList.toggle('active',   kind==='proofread');
+    loadReviewList();
+    document.getElementById('reviewOut').textContent = '';
+  }
+  tabGeneral.addEventListener('click', ()=>setTab('general'));
+  tabProof.addEventListener('click',   ()=>setTab('proofread'));
+
+  const reviewInput = document.getElementById('reviewInput');
+  const rvUseNotesWhenEmpty = document.getElementById('rvUseNotesWhenEmpty');
+  const rvAllowChunk = document.getElementById('rvAllowChunk');
+  const runReviewBtn = document.getElementById('runReviewBtn');
+  const rvProg = document.getElementById('rvProg');
+  const rvCancelBtn = document.getElementById('rvCancelBtn');
+  const rvStatus = document.getElementById('rvStatus');
+  const reviewOut = document.getElementById('reviewOut');
+  const reviewList = document.getElementById('reviewList');
+  const compareBtn = document.getElementById('compareBtn');
+  const compareOut = document.getElementById('compareOut');
+  let selectedForCompare = new Set();
+  let activeControllers = [];
+  let cancelRequested = false;
+
+  function renderReviewList(items){
+    reviewList.innerHTML = items.map(it => `
+      <div class="li" data-id="${it.id}">
+        <div class="rowflex">
+          <input type="checkbox" class="pick">
+          <h4 title="${new Date(it.created_at).toLocaleString()}">${esc(it.title)} • <span class="small">${new Date(it.created_at).toLocaleString()}</span></h4>
+          <button class="linklike show" type="button">הצג/הסתר</button>
+          <button class="linklike talk" type="button">לדון בביקורת</button>
+          <button class="linklike del" type="button">מחק</button>
+        </div>
+        <div class="box body" style="display:none; white-space:pre-wrap">${esc(it.result||"")}</div>
+      </div>
+    `).join("");
+
+    [...reviewList.querySelectorAll(".li")].forEach(li=>{
+      const id = li.getAttribute("data-id");
+      li.querySelector(".show").addEventListener("click", ()=>{
+        const body = li.querySelector(".body");
+        body.style.display = (body.style.display==="none" ? "block" : "none");
+      });
+      li.querySelector(".del").addEventListener("click", async ()=>{
+        if (!confirm("למחוק ביקורת זו?")) return;
+        await fetch(`/reviews/${pid}/delete`, {method:"POST", headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body:new URLSearchParams({ id })});
+        await loadReviewList();
+      });
+      li.querySelector(".pick").addEventListener("change", (e)=>{
+        if (e.target.checked) {
+          if (selectedForCompare.size >= 2){ e.target.checked = false; alert("ניתן לבחור עד 2 להשוואה."); return; }
+          selectedForCompare.add(id);
+        } else {
+          selectedForCompare.delete(id);
+        }
+      });
+      li.querySelector(".talk").addEventListener("click", ()=>{
+        const snippet = (li.querySelector(".body").textContent || "").slice(0, 500);
+        promptEl.value = "יש לי שאלות על הביקורת ("+new Date().toLocaleString()+"):\\n\\n"+snippet+"\\n\\n— אנא הדגם ודון בנקודות שהעלית.";
+        modeRadios.find(r=>r.value==='brainstorm').checked = true;
+        applyModeUI();
+        promptEl.dataset.reviewId = id;
+        promptEl.focus();
+      });
+    });
+  }
+
+  async function loadReviewList(){
+    selectedForCompare.clear();
+    compareOut.innerHTML = "";
+    const res = await fetch(`/reviews/${pid}?kind=${currentReviewKind}`);
+    const data = await res.json();
+    renderReviewList(data.items || []);
+  }
+
+  compareBtn.addEventListener("click", async ()=>{
+    if (selectedForCompare.size === 0){ alert("בחר ביקורת אחת או שתיים להשוואה."); return; }
+    const ids = Array.from(selectedForCompare);
+    const res = await fetch(`/reviews/${pid}/by_ids?ids=${ids.join(",")}`);
+    const data = await res.json();
+    const a = data.items[0], b = data.items[1];
+    if (ids.length === 1){
+      compareOut.innerHTML = `<div class="box">${esc(a?.result||"—")}</div>`;
+    } else {
+      compareOut.innerHTML = `
+        <div class="box"><div class="small">${esc(a.title)} • ${new Date(a.created_at).toLocaleString()}</div>${esc(a.result||"—")}</div>
+        <div class="box"><div class="small">${esc(b.title)} • ${new Date(b.created_at).toLocaleString()}</div>${esc(b.result||"—")}</div>`;
+    }
+  });
+
+  function resetProgress(){
+    rvProg.style.display="none"; rvProg.value=0; rvProg.max=100;
+    rvCancelBtn.style.display="none";
+    rvStatus.textContent="";
+    cancelRequested=false;
+    activeControllers.forEach(c=>{try{c.abort()}catch(_){}}); activeControllers=[];
+  }
+
+  rvCancelBtn.addEventListener("click", ()=>{
+    cancelRequested=true;
+    activeControllers.forEach(c=>{try{c.abort()}catch(_){}}); activeControllers=[];
+    rvStatus.textContent = "בוטל.";
+    rvCancelBtn.style.display="none";
+  });
+
+  async function fetchChunkWithTimeoutRetry(kind, text, attempt=1){
+    const ctrl = new AbortController(); activeControllers.push(ctrl);
+    const timer = setTimeout(()=>ctrl.abort(), CHUNK_TIMEOUT_MS);
+    try{
+      const res = await fetch(`/review/${pid}/chunk`, {
+        method:"POST",
+        headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+        body: new URLSearchParams({ kind, text }),
+        signal: ctrl.signal
+      });
+      clearTimeout(timer);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "שגיאת חלק");
+      return data.part || "";
+    }catch(e){
+      clearTimeout(timer);
+      if (attempt < CHUNK_MAX_RETRIES && !cancelRequested){
+        await new Promise(r=>setTimeout(r, attempt*1200));
+        return fetchChunkWithTimeoutRetry(kind, text, attempt+1);
+      }
+      throw e;
+    }
+  }
+
+  async function runChunked(kind, fullText, source){
+    const chunks = chunkText(fullText);
+    const N = chunks.length;
+    const results = new Array(N);
+    let done = 0;
+
+    rvProg.style.display="inline-block"; rvProg.max = N; rvProg.value = 0;
+    rvCancelBtn.style.display="inline-block";
+    rvStatus.textContent = `0 / ${N}`;
+
+    let nextIdx = 0;
+    async function worker(){
+      while(!cancelRequested && nextIdx < N){
+        const i = nextIdx++;
+        try{
+          const part = await fetchChunkWithTimeoutRetry(kind, chunks[i], 1);
+          results[i] = part;
+          done++; rvProg.value = done; rvStatus.textContent = `${done} / ${N}`;
+        }catch(e){
+          if (cancelRequested) return;
+          alert("שגיאה בעיבוד חלק "+(i+1)+": "+(e.message||e));
+          cancelRequested=true;
+          return;
+        }
+      }
+    }
+
+    const workers = [];
+    for(let k=0;k<CONCURRENCY;k++) workers.push(worker());
+    await Promise.all(workers);
+
+    if (cancelRequested){ resetProgress(); return null; }
+
+    const res = await fetch(`/review/${pid}/synthesize`, {
+      method:"POST",
+      headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+      body: new URLSearchParams({
+        kind, source, input_size: String(fullText.length),
+        parts: JSON.stringify(results)
+      })
+    });
+    const data = await res.json();
+    if (!data.ok){ resetProgress(); alert(data.error||"שגיאת סינתזה"); return null; }
+    rvStatus.textContent = `הושלם (${N} חלקים)`;
+    rvProg.style.display="none"; rvCancelBtn.style.display="none";
+    return data.result || "";
+  }
+
+  runReviewBtn.addEventListener("click", async ()=>{
+    reviewOut.textContent = "";
+    resetProgress();
+    try{
+      let text = reviewInput.value.trim();
+      let source = text ? "pasted" : "notes";
+      if (!text){
+        if (!rvUseNotesWhenEmpty.checked){ alert("אין טקסט בתיבה ונבחר לא להשתמש ב'קובץ כללי'."); return; }
+        const g = await (await fetch("/general/"+pid)).json();
+        text = (g.text||"").trim();
+        if (!text){ alert("'קובץ כללי' ריק."); return; }
+      }
+      const kind = currentReviewKind;
+
+      if (!rvAllowChunk.checked && text.length > MAX_SINGLE){
+        const res = await fetch(`/review/${pid}/run`, {
+          method:"POST",
+          headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+          body: new URLSearchParams({ kind, text, use_notes_when_empty: "0", strategy: "fail" })
+        });
+        const data = await res.json();
+        if (!data.ok) alert(data.error || "הטקסט ארוך מדי ליחידה אחת.");
+        return;
+      }
+
+      if (text.length <= MAX_SINGLE){
+        rvStatus.textContent = "מריץ ביקורת (יחידה אחת)...";
+        const one = await (await fetch(`/review/${pid}/chunk`, {
+          method:"POST",
+          headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+          body: new URLSearchParams({ kind, text })
+        })).json();
+        if (!one.ok){ alert(one.error || "שגיאה"); return; }
+        const fin = await (await fetch(`/review/${pid}/synthesize`, {
+          method:"POST",
+          headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+          body: new URLSearchParams({ kind, source, input_size: String(text.length), parts: JSON.stringify([one.part||""]) })
+        })).json();
+        if (!fin.ok){ alert(fin.error || "שגיאה"); return; }
+        reviewOut.textContent = fin.result || "—";
+        await loadReviewList();
+        rvStatus.textContent = "הושלם";
+        return;
+      }
+
+      const finalReport = await runChunked(kind, text, source);
+      if (finalReport!=null){
+        reviewOut.textContent = finalReport;
+        await loadReviewList();
+      }
+    }catch(e){
+      alert("שגיאה: "+(e.message||e));
+    }finally{
+      rvCancelBtn.style.display="none";
+    }
+  });
+
+  // טיוטה מקומית לשדה השיחה
+  promptEl.value = localStorage.getItem(DRAFT_KEY) || "";
+  promptEl.addEventListener("input", ()=> localStorage.setItem(DRAFT_KEY, promptEl.value));
+
+  // מצב התחלתי
+  applyModeUI();
+  await loadReviewList();
+  await loadChat();
+
+  // “לדון בביקורת” (משליך מזהה לבקשה הבאה)
+  document.getElementById('sendBtn').addEventListener("click", ()=>{
+    const rid = promptEl.dataset.reviewId;
+    if (rid){ sendText(rid); delete promptEl.dataset.reviewId; } else { sendText(); }
+  });
+
+})();</script>
+</body>
+</html>
+"""
+
+def render(t, **kw):
+    return HTMLResponse(Template(t).render(**kw))
+
+# ====== Utils ======
+_WORD_SPLIT = re.compile(r"[^\w\u0590-\u05FF]+")
+def _chunk_text(text: str, chunk_size=12000, overlap=800):
+    text = text or ""
+    chunks = []
+    n = len(text)
+    i = 0
+    while i < n:
+        j = min(i + chunk_size, n)
+        chunks.append(text[i:j])
+        if j == n: break
+        i = max(0, j - overlap)
+    return chunks
+
+def _score_chunk(chunk: str, query: str):
+    q_tokens = [t for t in _WORD_SPLIT.split(query.lower()) if t]
+    c_low = chunk.lower()
+    return sum(2 for t in q_tokens if t in c_low) + (0.1 if chunk else 0)
+
+def select_relevant_slices(notes_text: str, query: str, k=8):
+    chunks = _chunk_text(notes_text or "", chunk_size=1200, overlap=200)
+    scored = sorted(((c, _score_chunk(c, query)) for c in chunks), key=lambda x: x[1], reverse=True)
+    top = [c for c, s in scored[:k] if s > 0]
+    if not top and chunks:
+        top = chunks[:min(k, len(chunks))]
+    return top
+
+def build_rules_preamble(project_id: int) -> str:
+    with Session(engine) as session:
+        rules = session.exec(select(Rule).where((Rule.project_id == None) | (Rule.project_id == project_id))).all()
+    enforced = [r.text for r in rules if r.mode == "enforce"]
+    warns    = [r.text for r in rules if r.mode == "warn"]
+    out=[]
+    if enforced:
+        out.append("אכוף את הכללים:\n- " + "\n- ".join(enforced))
+    if warns:
+        out.append("אם יש חריגה — ציין זאת באדיבות (אזהרה), אך המשך.")
+    return ("\n\n".join(out)+"\n\n") if out else ""
+
+# ====== Routes: בית/פרויקטים ======
+@app.get("/", response_class=HTMLResponse)
+def home():
+    with Session(engine) as session:
+        projects = session.exec(select(Project)).all()
+    return render(HOME_HTML, projects=projects)
+
+@app.post("/new_project")
+def new_project(name: str = Form(...), kind: str = Form(...)):
+    with Session(engine) as session:
+        p = Project(name=name, kind=kind)
+        session.add(p); session.commit()
+        if not session.exec(select(GeneralNotes).where(GeneralNotes.project_id==p.id)).first():
+            session.add(GeneralNotes(project_id=p.id, text="")); session.commit()
+    return RedirectResponse("/", status_code=303)
+
+@app.get("/project/{project_id}", response_class=HTMLResponse)
+def project_page(project_id: int):
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if not session.exec(select(GeneralNotes).where(GeneralNotes.project_id == project_id)).first():
+            session.add(GeneralNotes(project_id=project_id, text="")); session.commit()
+    return render(PROJECT_HTML, project=project)
+
+# ====== שיחה / היסטוריה / קובץ כללי ======
+@app.get("/chat/{project_id}")
+def get_chat(project_id: int):
+    with Session(engine) as session:
+        rows = session.exec(select(History).where(History.project_id == project_id).order_by(History.created_at.asc())).all()
+    items = [{"q": r.question, "a": r.answer, "time": r.created_at.isoformat()} for r in rows]
+    return JSONResponse({"items": items})
+
+@app.post("/chat/{project_id}/clear")
+def clear_chat(project_id: int):
+    with Session(engine) as session:
+        items = session.exec(select(History).where(History.project_id == project_id)).all()
+        for it in items: session.delete(it)
+        session.commit()
+    return JSONResponse({"ok": True})
+
+@app.get("/history/{project_id}")
+def get_history(project_id: int):
+    with Session(engine) as session:
+        rows = session.exec(select(History.question).where(History.project_id == project_id).order_by(History.created_at.desc())).all()
+    return JSONResponse({"items": [r[0] if isinstance(r, tuple) else r for r in rows]})
+
+@app.post("/history/{project_id}/clear")
+def clear_history(project_id: int):
+    with Session(engine) as session:
+        items = session.exec(select(History).where(History.project_id == project_id)).all()
+        for it in items: session.delete(it)
+        session.commit()
+    return JSONResponse({"ok": True})
+
+@app.get("/general/{project_id}")
+def get_general(project_id: int):
+    with Session(engine) as session:
+        gn = session.exec(select(GeneralNotes).where(GeneralNotes.project_id == project_id)).first()
+        text = gn.text if gn else ""
+    return JSONResponse({"text": text})
+
+@app.post("/general/{project_id}")
+def save_general(project_id: int, text: str = Form("")):
+    with Session(engine) as session:
+        gn = session.exec(select(GeneralNotes).where(GeneralNotes.project_id == project_id)).first()
+        if not gn:
+            session.add(GeneralNotes(project_id=project_id, text=text))
+        else:
+            gn.text = text
+            gn.updated_at = datetime.utcnow()
+        session.commit()
+    return JSONResponse({"ok": True})
+
+# ====== Rules API ======
+@app.get("/rules/{project_id}")
+def rules_list(project_id: int):
+    with Session(engine) as session:
+        global_rules = session.exec(select(Rule).where(Rule.project_id == None).order_by(Rule.created_at.asc())).all()
+        project_rules = session.exec(select(Rule).where(Rule.project_id == project_id).order_by(Rule.created_at.asc())).all()
+    def to_dict(r): return {"id": r.id, "text": r.text, "mode": r.mode}
+    return JSONResponse({"global": [to_dict(r) for r in global_rules], "project": [to_dict(r) for r in project_rules]})
+
+@app.post("/rules/{project_id}/add")
+def rules_add(project_id: int, scope: str = Form(...), text: str = Form(...), mode: str = Form("enforce")):
+    pid = None if scope == "global" else project_id
+    with Session(engine) as session:
+        r = Rule(project_id=pid, text=text, mode=mode)
+        session.add(r); session.commit()
+    return JSONResponse({"ok": True})
+
+@app.post("/rules/{project_id}/update")
+def rules_update(project_id: int, id: int = Form(...), text: str = Form(...), mode: str = Form(...)):
+    with Session(engine) as session:
+        r = session.get(Rule, id)
+        if r:
+            r.text = text; r.mode = mode; session.commit()
+    return JSONResponse({"ok": True})
+
+@app.post("/rules/{project_id}/delete")
+def rules_delete(project_id: int, id: int = Form(...)):
+    with Session(engine) as session:
+        r = session.get(Rule, id)
+        if r:
+            session.delete(r); session.commit()
+    return JSONResponse({"ok": True})
+
+# ====== Ask ======
+@app.post("/ask/{project_id}")
+def ask_project(
+    project_id: int,
+    text: str = Form(...),
+    use_notes: str = Form("1"),
+    mode: str = Form("brainstorm"),
+    write_kind: str = Form("outline"),
+    review_id: Optional[int] = Form(None)
+):
+    with Session(engine) as session:
+        turns = session.exec(
+            select(History)
+            .where(History.project_id == project_id)
+            .order_by(History.created_at.desc())
+            .limit(10)
+        ).all()
+        turns = list(reversed(turns))
+        notes_text = ""
+        if use_notes == "1":
+            gn = session.exec(select(GeneralNotes).where(GeneralNotes.project_id == project_id)).first()
+            notes_text = gn.text if gn else ""
+        review_ctx = None
+        if review_id:
+            r = session.get(Review, review_id)
+            if r and r.project_id == project_id:
+                review_ctx = r.result
+
+    slices = select_relevant_slices(notes_text, text, k=8) if (use_notes == "1" and notes_text) else []
+    rules_preamble = build_rules_preamble(project_id)
+    chat_summary = "\n".join([f"שאלה: {t.question}\nתשובה: {t.answer}\n" for t in turns]) if turns else ""
+    context = ""
+    if slices:
+        context += "מידע רקע מתוך 'קובץ כללי' (קטעים רלוונטיים):\n" + "\n---\n".join(slices) + "\n\n"
+    if review_ctx:
+        context += "הקשר: תוצאות ביקורת קודמת רלוונטית:\n" + review_ctx + "\n\n"
+
+    if mode == "brainstorm":
+        instruction = """אתה פועל במצב סיעור מוחות.
+- אם נשאלה שאלה ישירה, ענה עליה בקצרה ובדיוק לפני הצעת רעיונות.
+החזר: 4–8 כיוונים עם יתרונות/חסרונות; שאלות מפתח; מתווה ראשוני (3–7 סעיפים)."""
+    else:
+        if write_kind == "outline":
+            instruction = """מצב כתיבה: מתווה פרק. החזר מתווה ממוספר עם מטרות סצנות, מעברים, דמויות ועוגני עקביות; בסוף נקודות בקרה קצרות."""
+        elif write_kind == "draft":
+            instruction = """מצב כתיבה: טיוטת פרק. כתיבה ממוקדת, טון/סגנון לפי כללים, עקביות דמויות/זמנים/מקומות, קצב טוב."""
+        else:
+            instruction = """מצב כתיבה: שכתוב ושיפור. שפר זרימה ובהירות; שמור על התוכן; בסוף רשום בבולטים מה שינית."""
+
+    prompt = f"""{rules_preamble}{context}התייחס לרצף השיחה הקודם (אם קיים) ולמידע הרקע לעיל.
+שמור על עקביות מלאה עם 'קובץ כללי' וכללי הגג/הפרויקט.
+
+שיחה קודמת (תקציר):
+{chat_summary}
+
+מצב עבודה: {('סיעור מוחות' if mode=='brainstorm' else 'כתיבה: ' + ('מתווה' if write_kind=='outline' else 'טיוטה' if write_kind=='draft' else 'שכתוב'))}
+
+בקשה:
+{text}
+
+הוראות:
+{instruction}
+"""
+    resp = client.models.generate_content(model="gemini-2.0-flash", contents=[prompt])
+    answer = resp.text
+
+    with Session(engine) as session:
+        display_tag = "【סיעור】" if mode=="brainstorm" else ("【כתיבה: " + ("מתווה" if write_kind=="outline" else "טיוטה" if write_kind=="draft" else "שכתוב") + "】")
+        session.add(History(project_id=project_id, question=f"{display_tag} {text}", answer=answer))
+        session.commit()
+
+    return JSONResponse({"answer": answer})
+
+# ====== ביקורת ======
+MAX_SINGLE_CHARS = 24000
+CHUNK_SIZE = 12000
+CHUNK_OVERLAP = 800
+
+def _review_general_block(text_block: str, rules_preamble: str) -> str:
+    p = f"""{rules_preamble}בצע ביקורת כללית (עברית) לקטע הבא:
+- סגנון כתיבה, קצב וטון
+- רציפות עלילתית והיגיון פנימי
+- מידת העניין והמתח
+- התאמה לקהל היעד
+השב בתבנית: תקציר קצר → נקודות חוזק → נקודות לשיפור → המלצות פעולה ממוקדות.
+קטע:
+{text_block}"""
+    r = client.models.generate_content(model="gemini-2.0-flash", contents=[p])
+    return r.text
+
+def _review_proof_block(text_block: str) -> str:
+    p = f"""בצע הגהה לקטע הבא בעברית:
+- שגיאות כתיב ותחביר (ציין תיקון והסבר קצר)
+- כפילויות מילים/פעלים בסמיכות (ציין היכן ומה ההצעה)
+החזר רשימה ממוספרת ותמציתית; אל תשכתב את היצירה כולה.
+קטע:
+{text_block}"""
+    r = client.models.generate_content(model="gemini-2.0-flash", contents=[p])
+    return r.text
+
+def _synthesize_reviews(kind: str, parts: list[str], rules_preamble: str) -> str:
+    joined = "\n\n--- חלק ---\n\n".join(parts)
+    if kind == "general":
+        p = f"""{rules_preamble}להלן ממצאים חלקיים מבדיקת חלקים שונים של אותו טקסט.
+אחד אותם לדוח ביקורת יחיד על הטקסט המקורי (בעברית), ללא דיון על הממצאים.
+כותרות:
+- תקציר קצר
+- נקודות חוזק מרכזיות
+- נקודות לשיפור
+- המלצות פעולה ממוקדות (3–7 צעדים)
+ממצאים:
+{joined}"""
+    else:
+        p = f"""להלן ממצאי הגהה מחלקים שונים של אותו טקסט.
+אחד לרשימה אחודה ומסודרת לפי סוג (כתיב/תחביר/כפילויות), בלי כפילויות ובלי מחמאות.
+ממצאים:
+{joined}"""
+    r = client.models.generate_content(model="gemini-2.0-flash", contents=[p])
+    return r.text
+
+@app.post("/review/{project_id}/chunk")
+def review_chunk(project_id: int, kind: str = Form(...), text: str = Form(...)):
+    kind = "general" if kind not in ("general","proofread") else kind
+    rules_preamble = build_rules_preamble(project_id)
+    if kind=="general":
+        part = _review_general_block(text, rules_preamble)
+    else:
+        part = _review_proof_block(text)
+    return JSONResponse({"ok": True, "part": part})
+
+@app.post("/review/{project_id}/synthesize")
+def review_synthesize(project_id: int, kind: str = Form(...), parts: str = Form(...), source: str = Form("pasted"), input_size: int = Form(0)):
+    try:
+        parts_list = json.loads(parts) if parts else []
+        if not isinstance(parts_list, list): raise ValueError("bad parts")
+    except Exception:
+        return JSONResponse({"ok": False, "error": "parts must be JSON array"})
+    rules_preamble = build_rules_preamble(project_id)
+    result = parts_list[0] if len(parts_list)==1 else _synthesize_reviews(kind, parts_list, rules_preamble)
+    with Session(engine) as session:
+        title = "מודבק" if source=="pasted" else "קובץ כללי"
+        session.add(Review(project_id=project_id, kind=kind, source=source, title=title, result=result, input_size=input_size))
+        session.commit()
+    return JSONResponse({"ok": True, "result": result})
+
+@app.post("/review/{project_id}/run")
+def run_review_legacy(
+    project_id: int,
+    kind: str = Form(...),  # "general" | "proofread"
+    text: str = Form(""),
+    use_notes_when_empty: str = Form("1"),
+    strategy: str = Form("chunk")  # "chunk" | "fail"
+):
+    kind = "general" if kind not in ("general","proofread") else kind
+    source = "pasted" if (text.strip()) else "notes"
+    if source == "notes":
+        if use_notes_when_empty != "1":
+            return JSONResponse({"ok": False, "error": "אין טקסט בתיבה ונבחר לא להשתמש ב'קובץ כללי'."})
+        with Session(engine) as session:
+            gn = session.exec(select(GeneralNotes).where(GeneralNotes.project_id == project_id)).first()
+            if not (gn and gn.text.strip()):
+                return JSONResponse({"ok": False, "error": "'קובץ כללי' ריק."})
+            text = gn.text
+
+    text = text.strip()
+    total_len = len(text)
+    rules_preamble = build_rules_preamble(project_id)
+
+    if strategy == "fail" and total_len > MAX_SINGLE_CHARS:
+        return JSONResponse({"ok": False, "error": f"הטקסט ארוך מדי לבדיקה ביחידה אחת ({total_len} תווים). אפשר 'חלק אוטומטית' כדי לכסות את כולו."})
+
+    if total_len <= MAX_SINGLE_CHARS:
+        result = _review_general_block(text, rules_preamble) if kind=="general" else _review_proof_block(text)
+    else:
+        parts = []
+        for blk in _chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+            parts.append(_review_general_block(blk, rules_preamble) if kind=="general" else _review_proof_block(blk))
+        result = _synthesize_reviews(kind, parts, rules_preamble)
+
+    with Session(engine) as session:
+        title = ("מודבק" if source=="pasted" else "קובץ כללי")
+        session.add(Review(project_id=project_id, kind=kind, source=source, title=title, result=result, input_size=total_len))
+        session.commit()
+
+    return JSONResponse({"ok": True, "result": result})
+
+@app.get("/reviews/{project_id}")
+def list_reviews(project_id: int, kind: str = ""):
+    with Session(engine) as session:
+        q = select(Review).where(Review.project_id == project_id).order_by(Review.created_at.desc())
+        if kind in ("general","proofread"):
+            q = q.where(Review.kind == kind)
+        rows = session.exec(q).all()
+    items = [{"id": r.id, "kind": r.kind, "source": r.source, "title": r.title, "result": r.result, "created_at": r.created_at.isoformat()} for r in rows]
+    return JSONResponse({"items": items})
+
+@app.get("/reviews/{project_id}/by_ids")
+def get_reviews_by_ids(project_id: int, ids: str):
+    id_list = [int(x) for x in (ids or "").split(",") if x.strip().isdigit()]
+    with Session(engine) as session:
+        rows = session.exec(select(Review).where((Review.project_id==project_id) & (Review.id.in_(id_list)))).all()
+    items = [{"id": r.id, "kind": r.kind, "source": r.source, "title": r.title, "result": r.result, "created_at": r.created_at.isoformat()} for r in rows]
+    return JSONResponse({"items": items})
+
+@app.post("/reviews/{project_id}/delete")
+def delete_review(project_id: int, id: int = Form(...)):
+    with Session(engine) as session:
+        r = session.get(Review, id)
+        if r and r.project_id == project_id:
+            session.delete(r); session.commit()
+    return JSONResponse({"ok": True})
+
+# ====== איורים ======
+@app.post("/image/{project_id}")
+def create_image(project_id: int, desc: str = Form(...), style: str = Form(""), use_notes: str = Form("1")):
+    rules_preamble = build_rules_preamble(project_id)
+    with Session(engine) as session:
+        gn = session.exec(select(GeneralNotes).where(GeneralNotes.project_id == project_id)).first()
+        notes_text = (gn.text if gn else "") if use_notes == "1" else ""
+    slices = select_relevant_slices(notes_text, desc, k=5) if notes_text else []
+    context = ("רקע ודגשים לעקביות (מתוך 'קובץ כללי'):\n" + "\n---\n".join(slices) + "\n\n") if slices else ""
+    style_line = f"סגנון מבוקש: {style}\n" if style.strip() else ""
+    prompt = f"""{rules_preamble}{context}{style_line}צור תמונה אחת לפי התיאור הבא. שמור על עקביות דמויות/לבוש/עולם אם משתמע מהרקע.
+תיאור: {desc}
+פורמט: PNG, יחס מתאים לקומפוזיציה, בלי טקסטים על התמונה.
+"""
+    resp = client.models.generate_content(model="gemini-2.5-flash-image-preview", contents=[prompt])
+
+    img_bytes = None
+    for cand in getattr(resp, "candidates", []) or []:
+        for part in getattr(cand.content, "parts", []) or []:
+            inline = getattr(part, "inline_data", None)
+            if inline is not None:
+                data = inline.data
+                img_bytes = b64decode(data) if isinstance(data, str) else data
+                break
+        if img_bytes: break
+
+    if not img_bytes:
+        return JSONResponse({"ok": False, "error": "no_image_returned"})
+
+    project_dir = os.path.join(MEDIA_ROOT, f"project_{project_id}")
+    os.makedirs(project_dir, exist_ok=True)
+    filename = f"img_{uuid.uuid4().hex}.png"
+    path = os.path.join(project_dir, filename)
+    with open(path, "wb") as f:
+        f.write(img_bytes)
+
+    rel_url = f"/media/project_{project_id}/{filename}"
+    with Session(engine) as session:
+        session.add(Illustration(project_id=project_id, file_path=rel_url, prompt=desc, style=style))
+        session.commit()
+    return JSONResponse({"ok": True, "url": rel_url})
+
+@app.post("/image/{project_id}/plan")
+def plan_image_from_text(project_id: int, text: str = Form(...), use_notes: str = Form("1")):
+    """מקבל קטע טקסט ומחזיר הצעת תיאור+סגנון לאיור."""
+    with Session(engine) as session:
+        gn = session.exec(select(GeneralNotes).where(GeneralNotes.project_id == project_id)).first()
+        notes_text = (gn.text if gn else "") if use_notes == "1" else ""
+    slices = select_relevant_slices(notes_text, text, k=5) if notes_text else []
+    rules_preamble = build_rules_preamble(project_id)
+    ctx = ("רקע לעקביות:\n" + "\n---\n".join(slices) + "\n\n") if slices else ""
+    p = f"""{rules_preamble}{ctx}
+קרא את הקטע הבא והצע תכנון איור תמציתי שמותאם לקומיקס/פרוזה:
+- תיאור איור (Sentence אחד ברור; מה רואים בפריים)
+- סגנון חזותי (למשל: קומיקס קלאסי, דיו שחור-לבן, אקוורל, ריאליסטי נקי)
+החזר JSON עם מפתחות: desc, style. בלי טקסט נוסף.
+קטע:
+{text}"""
+    r = client.models.generate_content(model="gemini-2.0-flash", contents=[p])
+    raw = (r.text or "").strip()
+    # נסה לפענח JSON; אם אין, עטוף
+    try:
+        data = json.loads(raw)
+        plan = {"desc": data.get("desc",""), "style": data.get("style","")}
+    except Exception:
+        # fallback גס: פצל לפי שורות
+        lines = [x.strip("- •: ") for x in raw.splitlines() if x.strip()]
+        desc = (lines[0] if lines else "")[:400]
+        style = (lines[1] if len(lines)>1 else "")
+        plan = {"desc": desc, "style": style}
+    return JSONResponse({"ok": True, "plan": plan})
+
+@app.get("/images/{project_id}")
+def list_images(project_id: int):
+    with Session(engine) as session:
+        rows = session.exec(select(Illustration).where(Illustration.project_id == project_id).order_by(Illustration.created_at.desc())).all()
+    items = [{"url": r.file_path, "prompt": r.prompt, "style": r.style, "created_at": r.created_at.isoformat()} for r in rows]
+    return JSONResponse({"items": items})

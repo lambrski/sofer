@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html dir="rtl">
+<head>
+  <meta charset="utf-t">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{project.name}} - סתם סופר</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 15px;}
+    h1 { margin-bottom: 4px; } h2 { margin: 0 0 10px 0; color: #444; display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+    textarea { width: 100%; font-size: 16px; box-sizing: border-box; } button { padding: 6px 14px; margin-top: 6px; cursor:pointer; }
+    input {box-sizing: border-box;}
+    .btnrow{display:flex; gap:8px; align-items:center; flex-wrap:wrap} #status { color: #666; font-size: 13px; margin-top: 4px; }
+    #result { margin-top: 16px; padding: 12px; border: 1px solid #ddd; border-radius: 10px; min-height: 160px; max-height: 55vh; overflow:auto; background:#fff; display: flex; flex-direction: column-reverse;}
+    .turn { margin: 10px 0; } .meta{color:#888; font-size:12px; margin-bottom:4px; display: flex; justify-content: space-between; align-items: center;}
+    .bubble{border:1px solid #e6e6e6; border-radius:12px; padding:10px; white-space:pre-wrap; flex-grow: 1; position: relative;}
+    .q .bubble{background:#f9fbff} .a .bubble{background:#fafafa}
+    .copy-bubble { position: absolute; bottom: 5px; left: 5px; opacity: 0; transition: opacity 0.2s; cursor: pointer; font-size: 10px !important; padding: 2px 6px !important; margin:0 !important;}
+    .bubble:hover .copy-bubble { opacity: 1; }
+    .linklike { background:#f6f6f6; border:1px solid #ddd; border-radius:6px; padding:4px 8px; font-size:13px; cursor:pointer; }
+    .muted { color:#777; } .hint { color:#777; font-size:12px; text-align:right }
+    .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.3); display:none; z-index: 10; }
+    .modal { position:fixed; top:6%; left:50%; transform:translateX(-50%); width:min(1000px, 96vw); background:#fff; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.25); display:none; z-index: 11;}
+    .modal header { padding:10px 12px; border-bottom:1px solid #eee; display:flex; justify-content:space-between; align-items:center;}
+    .modal .content { max-height:75vh; overflow:auto; padding:10px 12px; }
+    .modal footer { padding:10px 12px; border-top:1px solid #eee; display:flex; gap:8px; justify-content:flex-end; align-items:center;}
+    #notesArea, #synopsisArea, #divisionResultArea {width:100%; font-size:15px}
+    #notesArea, #divisionResultArea {height:70vh;}
+    #synopsisArea {height:45vh;}
+    #chapterOutputContent { min-height: 50vh; white-space: pre-wrap; border: 1px solid #ddd; padding: 8px; border-radius: 8px; }
+    .pill{font-size:12px; padding:2px 6px; border:1px solid #ddd; border-radius:999px; display: inline-block; margin: 2px;}
+    .field{margin:6px 0} .field input, .field textarea, .field select{width:100%}
+    .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px}
+    .card{border:1px solid #eee; border-radius:8px; padding:6px} .card img{width:100%; height:180px; object-fit:cover; border-radius:6px; display:block}
+    .small{font-size:12px; color:#666} .list{border:1px solid #eee; border-radius:8px; padding:8px; max-height:40vh; overflow:auto}
+    .li{border-bottom:1px solid #f3f3f3; padding:6px 4px} .li:last-child{border-bottom:none} .li h4{margin:0 0 4px 0; font-size:14px}
+    .rowflex{display:flex; gap:8px; align-items:center; flex-wrap:wrap} .two-col{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+    .box{border:1px solid #eee; border-radius:8px; padding:8px} .tabs{display:flex; gap:8px; margin-top:6px}
+    .tabs .tabbtn{padding:6px 10px; border:1px solid #ddd; border-radius:999px; font-size:13px; cursor:pointer; background:#f6f6f6}
+    .tabs .tabbtn.active{background:#e8f0ff; border-color:#c7dbff}
+    #object-gallery {display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px;}
+    .object-card {border:1px solid #eee; border-radius:8px; padding:4px; text-align:center;}
+    .object-card img {width:100%; height:120px; object-fit:contain; border-radius:4px; background:#f8f8f8;}
+    .object-card h5 {margin:4px 0; font-size:13px;}
+    #editingIndicator {font-size: 13px; background: #fff8e1; border: 1px solid #ffecb3; padding: 4px 8px; border-radius: 6px; display: none; margin-bottom: 8px;}
+    .chapter-card, .outline-card { border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+    .chapter-card h5, .outline-card h5 { margin: 0 0 8px 0; font-size: 16px; }
+    .chapter-card .small, .outline-card .small { margin-bottom: 10px; }
+    .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; display: inline-block; }
+    #divisionModal footer {flex-wrap: wrap; justify-content: space-between;}
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    
+    @media (max-width: 600px) {
+        .two-col, .row { flex-direction: column; }
+        h2 { font-size: 1.2em; }
+    }
+  </style>
+</head>
+<body data-project-id="{{project.id}}" data-project-kind="{{project.kind}}">
+  <h1>✍ סתם סופר</h1>
+  <a href="/" style="float:left; margin-left:10px;">⬅ חזרה לרשימת פרויקטים</a>
+  <h2>📘 פרויקט: {{project.name}} ({{project.kind}})  
+    <button id="rulesBtn" class="linklike" type="button">כללים</button>  
+    <button id="notesBtn" class="linklike" type="button">קובץ כללי</button>  
+    <button id="synopsisBuilderBtn" class="linklike" type="button">🔨 יוצר התקצירים</button>
+    <button id="synopsisBtn" class="linklike" type="button">תקציר</button>
+    <button id="libraryBtn" class="linklike" type="button">📚 ספרייה</button>  
+    <button id="clearChatBtn" class="linklike" type="button">נקה שיחה</button>  
+  </h2>
+  <div class="rowflex" style="margin-bottom:6px"> <label class="linklike"><input type="radio" name="mode" value="brainstorm" checked> סיעור מוחות</label> <label class="linklike"><input type="radio" name="mode" value="write"> כתיבה</label> <label class="linklike"><input type="radio" name="mode" value="review"> ביקורת</label> <label class="linklike"><input type="radio" name="mode" value="illustrate"> איור</label>  
+    <select id="writeKind" style="display:none">  
+      <option value="outline">מתווה</option>
+      <option value="draft">טיוטה</option>  
+      <option value="rewrite">שכתוב ושיפור</option>
+      <option value="breakdown_chapter">כתוב פרק מתקציר</option>
+    </select>
+  </div>
+  <div class="hint">(Ctrl+Enter = שליחה/הרצה,  Shift+Enter = שורה חדשה)</div>
+  <div id="chatPanel">
+    <div id="brainstormControls" class="rowflex" style="margin-bottom:6px">
+        <label for="temperature">טמפרטורה (0.1=ממוקד, 1.0=יצירתי):</label>
+        <input type="range" id="temperature" name="temperature" min="0.1" max="1.0" value="0.7" step="0.1" style="flex:1;">
+        <span id="tempValue">0.7</span>
+        <select id="personaSelector" class="linklike">
+            <option value="partner">שותף יצירתי</option>
+            <option value="assistant">עוזר ישיר</option>
+        </select>
+    </div>
+    <textarea id="prompt" rows="8" placeholder="כתוב כאן טקסט או שאלה..."></textarea>
+    <div class="btnrow" style="justify-content: space-between;">
+        <div class="rowflex">
+            <button id="sendBtn" type="button">שלח</button>  
+            <label class="linklike" for="tempFileUpload">העלה קובץ לשיחה</label>
+            <input type="file" id="tempFileUpload" multiple style="display:none;">
+            <button id="attachFromLibraryBtn" class="linklike">צרף מהספרייה</button>
+        </div>
+        <div id="status" class="rowflex"></div>
+    </div>
+    <div class="btnrow" style="margin-top: 8px;">
+        <label style="font-size:13px"><input type="checkbox" id="useNotes" checked> התבסס על 'קובץ כללי'</label>  
+        <label style="font-size:13px"><input type="checkbox" id="useHistory" checked> השתמש בהיסטוריית השיחה</label>  
+        <button id="historyBtn" class="linklike" type="button" title="שאלות אחרונות">היסטוריית שאלות</button>
+    </div>
+    <div id="attached-files-list" class="rowflex" style="font-size:12px; margin-top:4px;"></div>
+    <div id="result"></div>
+  </div>
+  <div id="reviewPanel" style="display:none; margin-top:14px"> <div class="tabs"> <button class="tabbtn active" id="tabGeneral">ביקורת כללית</button> <button class="tabbtn" id="tabProof">הגהה</button> </div> <div class="row" style="margin-top:8px"> <div style="flex:2; min-width:300px"> <div class="field"> <label>טקסט לבדיקה (אם ריק — נבדוק את 'קובץ כללי'):</label> <textarea id="reviewInput" rows="10" placeholder="הדבק כאן טקסט מלא לבדיקה..."></textarea> </div> <div class="rowflex"> <label style="font-size:13px"><input type="checkbox" id="rvUseNotesWhenEmpty" checked> אם ריק — בדוק את 'קובץ כללי'</label> </div> <div class="rowflex"> <button id="runReviewBtn" class="linklike" type="button">הרץ ביקורת</button> <div id="rvStatus" class="rowflex" style="gap:8px;"></div></div> <div id="reviewOut" class="box" style="margin-top:8px; white-space:pre-wrap"></div> </div> <div style="flex:1; min-width:260px"> <h4 style="margin:0 0 8px 0">ביקורות קודמות</h4> <div id="reviewList" class="list"></div></div> </div> </div>
+  <div id="illustratePanel" style="display:none; margin-top:14px">
+    <div class="box">
+        <div id="editingIndicator">🎨 מצב עריכת תמונה. שנה את התיאור ולחץ "צור איור" כדי לעדכן את התמונה. <button id="cancelEditBtn" class="linklike small">בטל עריכה</button></div>
+        <div class="field"><label>תיאור הסצנה (המערכת תזהה אוטומטית שמות של אובייקטים מהמעבדה):</label><textarea id="imgDesc" rows="4" placeholder="למשל: שמוליק וצביקי בפתח מערת הרוחות"></textarea></div>
+        <div class="rowflex">
+            <div class="field" style="flex:1;"><label>סגנון:</label><input id="imgStyle" placeholder="קומיקס / אקוורל / וכו'"></div>
+            <div class="field" style="flex:1;"><label>תווית (למיון):</label><input id="imgScene" placeholder="למשל: הכניסה למערה"></div>
+        </div>
+        <div class="rowflex">
+            <button id="genImageBtn" class="linklike" type="button">צור איור</button>
+            <button id="objectLabBtn" class="linklike" type="button">🔬 פתח את מעבדת האובייקטים</button>
+            <div id="imgStatus" class="rowflex" style="gap:8px;"></div>
+        </div>
+    </div>
+    <hr>
+    <div id="gallery" class="grid"></div>
+  </div>
+
+  <div id="backdrop" class="modal-backdrop"></div>
+  <div id="notesModal" class="modal"> <header><strong>קובץ כללי — {{project.name}}</strong><button id="closeNotesBtn" class="linklike">סגור</button></header> <div class="content"><textarea id="notesArea"></textarea></div> <footer><button id="saveNotesBtn" class="linklike">שמור</button></footer> </div>
+  <div id="synopsisModal" class="modal"> 
+    <header><strong>תקציר — {{project.name}}</strong>
+      <div>
+        <button id="synopsisToggleViewBtn" class="linklike">הצג כרטיסיות פרקים</button>
+        <button id="closeSynopsisBtn" class="linklike">סגור</button>
+      </div>
+    </header> 
+    <div class="content">
+      <div id="synopsisEditorView">
+        <textarea id="synopsisArea"></textarea>
+        <hr style="margin: 12px 0;">
+        <h4 style="margin-top:0; margin-bottom:5px;">היסטוריית גרסאות</h4>
+        <div id="synopsisHistory" class="list" style="max-height: 25vh; font-size: 13px; white-space: pre-wrap;"></div>
+      </div>
+      <div id="synopsisCardView" style="display:none;" class="list"></div>
+    </div> 
+    <footer style="justify-content: space-between;">
+        <div class="rowflex">
+            <button id="divideSynopsisBtn" class="linklike" type="button">חלק תקציר לפרקים</button>
+            {% if project.kind == 'פרוזה' %}
+            <span id="proseDivideOptions">
+                מילים/פרק: <input type="number" id="prose_min_words" value="{{ project.words_per_chapter_min or 1500 }}" style="width: 60px;">
+                - <input type="number" id="prose_max_words" value="{{ project.words_per_chapter_max or 3000 }}" style="width: 60px;">
+            </span>
+            {% endif %}
+            <button id="clearSynopsisHistoryBtn" class="linklike">נקה היסטוריית גרסאות</button>
+        </div>
+        <button id="saveSynopsisBtn" class="linklike">שמור תקציר</button>
+    </footer> 
+  </div>
+  <div id="divisionModal" class="modal">
+    <header><strong>בחינה ושיפור של חלוקת הפרקים</strong><button id="closeDivisionModalBtn" class="linklike">סגור</button></header>
+    <div class="content">
+        <p class="muted small">להלן החלוקה שהתקבלה. ניתן לבקש שיפורים או לאשר את הגרסה ולהעביר אותה לעורך.</p>
+        <textarea id="divisionResultArea"></textarea>
+    </div>
+    <footer style="justify-content: space-between;">
+      <button id="openRefineChatBtn" class="linklike">💬 שפר חלוקה באמצעות דיון</button>
+      <button id="acceptDivisionBtn" class="linklike">אשר והעתק לעורך</button>
+    </footer>
+  </div>
+  <div id="histModal" class="modal"> <header><strong>היסטוריית שאלות</strong><div><button id="clearHistBtn" class="linklike">נקה</button><button id="closeHistBtn" class="linklike">סגור</button></div></header> <div id="histContent" class="content"></div> </div>
+  <div id="rulesModal" class="modal"> <header><strong>כללים</strong><button id="closeRulesBtn" class="linklike">סגור</button></header> <div class="content" id="rulesContent"> <h3>כללי גג <span class="pill">חלים על כל הפרויקטים</span></h3> <div id="rulesGlobal"></div> <div class="rowflex"> <textarea id="newGlobalText" style="flex:1; height:56px"></textarea> <select id="newGlobalMode"><option value="enforce">אכיפה</option><option value="warn">אזהרה</option><option value="off">כבוי</option></select> <button id="addGlobalBtn" class="linklike">הוסף</button> </div> <hr> <h3>כללי פרויקט <span class="pill">רק לפרויקט הנוכחי</span></h3> <div id="rulesProject"></div> <div class="rowflex"> <textarea id="newProjectText" style="flex:1; height:56px"></textarea> <select id="newProjectMode"><option value="enforce">אכיפה</option><option value="warn">אזהרה</option><option value="off">כבוי</option></select> <button id="addProjectBtn" class="linklike">הוסף</button> </div> </div> </div>
+  <div id="libraryModal" class="modal"> <header> <strong>ספרייה מרכזית</strong> <div class="rowflex"> <input type="text" id="libSearch" placeholder="חפש..." style="min-width:220px"> <label class="linklike" for="libUpload">העלה קבצים</label> <input type="file" id="libUpload" style="display:none" multiple accept=".pdf,.docx,.txt,.png,.jpg,.jpeg,.webp"> <button id="closeLibraryBtn" class="linklike">סגור</button> </div> </header> <div class="content"> <div class="small muted">סוגי קבצים נתמכים: PDF, DOCX, TXT, PNG, JPG, JPEG, WEBP</div> <div id="libraryList" class="list"></div> </div> </div>
+  <div id="libraryAttachModal" class="modal"> <header> <strong>צרף קבצים מהספרייה</strong> <button id="closeLibraryAttachBtn" class="linklike">סגור</button></header> <div id="libraryAttachList" class="content list"></div> <footer><button id="attachSelectedBtn" class="linklike">צרף נבחרים לשיחה</button></footer></div>
+  <div id="discussionModal" class="modal"> <header><strong id="discussionTitle">דיון בביקורת</strong><button id="closeDiscussionBtn" class="linklike">סגור</button></header> <div id="discussionThread" class="content list" style="max-height: 50vh;"></div> <footer style="background:#f8f8f8; align-items:center;"><input id="discussionInput" placeholder="שאל שאלה על ממצאי הביקורת..." style="flex:1; padding: 8px;"><button id="updateReviewBtn" class="linklike">עדכן דוח ביקורת</button><button id="askDiscussionBtn" class="linklike">שלח</button></footer></div>
+  <div id="objectLabModal" class="modal">
+    <header><strong>🔬 מעבדת האובייקטים</strong><button id="closeObjectLabBtn" class="linklike">סגור</button></header>
+    <div class="content two-col">
+        <div class="box">
+            <h4 style="margin-top:0;">יצירת אובייקט חדש</h4>
+            <div class="field"><label>שם האובייקט (מילה אחת, לזיהוי אוטומטי):</label><input id="objName" placeholder="למשל: שמוליק"></div>
+            <div class="field"><label>סגנון:</label><input id="objStyle" placeholder="ריאליסטי, קומיקס, שחור לבן..."></div>
+            <div class="field"><label>תיאור ויזואלי (מאפייני עקביות):</label><textarea id="objDesc" rows="4" placeholder="ילד עם שיער ג'ינג'י, פנים מנומשות..."></textarea></div>
+            <div class="rowflex"><button id="createObjectBtn" class="linklike">צור תמונת ייחוס</button><div id="objStatus" class="rowflex" style="gap:8px;"></div></div>
+        </div>
+        <div class="box">
+            <h4 style="margin-top:0;">ספריית האובייקטים של הפרויקט</h4>
+            <div id="object-gallery" class="list"></div>
+        </div>
+    </div>
+  </div>
+  
+  <div id="chapterOutputModal" class="modal">
+    <header>
+        <strong id="chapterOutputTitle">תוצר פרק</strong>
+        <button id="closeChapterOutputBtn" class="linklike">סגור</button>
+    </header>
+    <div class="content">
+        <div id="chapterOutputContent"></div>
+    </div>
+    <footer style="justify-content: space-between; flex-wrap:wrap;">
+        <button id="discussDraftBtn" class="linklike">💬 דיון על הטיוטה</button>
+        <div class="rowflex">
+          <button id="editChapterBtn" class="linklike">✍️ ערוך</button>
+          <button id="saveChapterEditsBtn" class="linklike" style="display:none;">💾 שמור שינויים</button>
+          <button id="appendChapterBtn" class="linklike">הוסף לקובץ כללי Append ➡️</button>
+        </div>
+    </footer>
+  </div>
+
+  <div id="chapterDiscussionModal" class="modal">
+    <header><strong id="chapterDiscussionTitle"></strong><button id="closeChapterDiscussionBtn" class="linklike">סגור</button></header>
+    <div id="chapterDiscussionThread" class="content list" style="max-height: 50vh;"></div>
+    <div class="content" style="border-top:1px solid #eee; padding-top:10px;">
+        <textarea id="chapterDiscussionInput" rows="3" placeholder="שאל שאלה על הפרק..."></textarea>
+    </div>
+    <footer style="justify-content: space-between; flex-wrap:wrap; background:#f8f8f8;">
+        <div id="chapterDiscussionControls" class="rowflex">
+            <label class="small">טמפ':</label>
+            <input type="range" id="discussTemp" min="0.1" max="1.0" value="0.2" step="0.1" style="flex:1; max-width:100px;">
+            <span id="discussTempValue" class="small">0.2</span>
+            <select id="discussPersona" class="linklike small">
+                <option value="assistant">עוזר ישיר</option>
+                <option value="partner">שותף יצירתי</option>
+            </select>
+        </div>
+        <div class="rowflex">
+            <button id="summarizeChapterBtn" class="linklike">סכם והצע עדכון</button>
+            <button id="sendChapterDiscussionBtn" class="linklike">שלח</button>
+        </div>
+    </footer>
+  </div>
+
+  <div id="synopsisBuilderModal" class="modal" style="width: min(1400px, 98vw);">
+    <header><strong>🔨 יוצר התקצירים</strong><button id="closeSynopsisBuilderBtn" class="linklike">סגור</button></header>
+    <div class="content two-col" style="max-height: 80vh;">
+        <div class="box" style="display:flex; flex-direction:column;">
+            <h4 style="margin-top:0;">טיוטת התקציר</h4>
+            <textarea id="synopsisBuilderArea" style="flex:1; font-size:15px;"></textarea>
+        </div>
+        <div class="box" style="display:flex; flex-direction:column;">
+            <h4 style="margin-top:0;">שיחה עם המודל</h4>
+            <div id="synopsisBuilderThread" class="list" style="flex:1;"></div>
+            <textarea id="synopsisBuilderInput" rows="3" placeholder="הנחיה לבניית התקציר..."></textarea>
+            <div id="synopsisBuilderControls" class="rowflex" style="justify-content:space-between; margin-top:6px;">
+                 <div class="rowflex">
+                    <label class="small">טמפ':</label>
+                    <input type="range" id="builderTemp" min="0.1" max="1.0" value="0.7" step="0.1" style="flex:1; max-width:100px;">
+                    <span id="builderTempValue" class="small">0.7</span>
+                    <select id="builderPersona" class="linklike small">
+                        <option value="partner">שותף יצירתי</option>
+                        <option value="assistant">עוזר ישיר</option>
+                    </select>
+                </div>
+                <button id="sendSynopsisBuilderBtn" class="linklike">שלח</button>
+            </div>
+        </div>
+    </div>
+    <footer style="justify-content: space-between;">
+        <div class="rowflex">
+            <button id="updateSynopsisFromDiscussionBtn" class="linklike">💡 עדכן טיוטה לפי הדיון</button>
+            <button id="saveSynopsisDraftBtn" class="linklike">💾 שמור טיוטה</button>
+        </div>
+        <button id="transferSynopsisBtn" class="linklike">✅ סיים והעבר לעורך הראשי</button>
+    </footer>
+  </div>
+  
+  <div id="refineDivisionChatModal" class="modal">
+    <header><strong id="refineDivisionChatTitle">דיון לשיפור החלוקה</strong><button id="closeRefineDivisionChatBtn" class="linklike">סגור</button></header>
+    <div id="refineDivisionChatThread" class="content list" style="max-height: 50vh;"></div>
+    <div class="content" style="border-top:1px solid #eee; padding-top:10px;">
+        <textarea id="refineDivisionChatInput" rows="3" placeholder="הנחיה לשיפור החלוקה..."></textarea>
+    </div>
+    <footer style="justify-content: space-between; flex-wrap:wrap; background:#f8f8f8;">
+        <div class="rowflex">
+            <label class="small">טמפ':</label>
+            <input type="range" id="refineTemp" min="0.1" max="1.0" value="0.2" step="0.1" style="flex:1; max-width:100px;">
+            <span id="refineTempValue" class="small">0.2</span>
+            <select id="refinePersona" class="linklike small">
+                <option value="assistant">עוזר ישיר</option>
+                <option value="partner">שותף יצירתי</option>
+            </select>
+        </div>
+        <div class="rowflex">
+            <button id="updateDivisionFromChatBtn" class="linklike">✅ עדכן חלוקה לפי הדיון</button>
+            <button id="sendRefineChatBtn" class="linklike">שלח</button>
+        </div>
+    </footer>
+  </div>
+
+  <div id="outlineManagerModal" class="modal">
+    <header>
+        <strong id="outlineManagerTitle">מתווה פרק</strong>
+        <button id="closeOutlineManagerBtn" class="linklike">סגור</button>
+    </header>
+    <div id="outlineManagerContent" class="content list"></div>
+    <footer style="justify-content: space-between;">
+        <button id="saveOutlineBtn" class="linklike">💾 שמור מתווה</button>
+        <button id="closeOutlineManagerBtnFooter" class="linklike">סגור</button>
+    </footer>
+  </div>
+
+  <div id="sceneDiscussionModal" class="modal">
+    <header><strong id="sceneDiscussionTitle">דיון על סצנה</strong><button id="closeSceneDiscussionBtn" class="linklike">סגור</button></header>
+    <div id="sceneDiscussionThread" class="content list" style="max-height: 45vh;"></div>
+    <div class="content" style="border-top:1px solid #eee; padding-top:10px;">
+        <textarea id="sceneDiscussionInput" rows="2" placeholder="שאל שאלה על הסצנה..."></textarea>
+    </div>
+    <footer style="justify-content: space-between; flex-wrap:wrap; background:#f8f8f8;">
+        <div class="rowflex">
+            <button id="summarizeSceneBtn" class="linklike">💡 סכם והצע עדכון לסצנה</button>
+        </div>
+        <div class="rowflex">
+            <button id="sendSceneDiscussionBtn" class="linklike">שלח</button>
+        </div>
+    </footer>
+  </div>
+
+  <div id="draftDiscussionModal" class="modal" style="width: min(1400px, 98vw);">
+    <header><strong id="draftDiscussionTitle">דיון על טיוטה</strong><button id="closeDraftDiscussionBtn" class="linklike">סגור</button></header>
+    <div class="content two-col" style="max-height: 80vh;">
+        <div class="box" style="display:flex; flex-direction:column;">
+            <h4 style="margin-top:0;">טיוטת הסצנה</h4>
+            <textarea id="draftDiscussionEditor" style="flex:1; font-size:15px;"></textarea>
+        </div>
+        <div class="box" style="display:flex; flex-direction:column;">
+            <h4 style="margin-top:0;">שיחה עם המודל</h4>
+            <div id="draftDiscussionThread" class="list" style="flex:1;"></div>
+            <textarea id="draftDiscussionInput" rows="3" placeholder="הנחיה לשיפור הטיוטה..."></textarea>
+            <div class="rowflex" style="justify-content:space-between; margin-top:6px;">
+                <button id="summarizeDraftBtn" class="linklike">💡 סכם ועדכן טיוטה</button>
+                <button id="sendDraftDiscussionBtn" class="linklike">שלח</button>
+            </div>
+        </div>
+    </div>
+  </div>
+
+<script src="/static/js/main.js" type="module"></script>
+</body>
+</html>
